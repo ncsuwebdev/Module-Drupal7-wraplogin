@@ -1,0 +1,728 @@
+<?php
+
+/**
+ * @file
+ * Integrates NCSU WRAP login system with Drupal 7.
+ *
+ * Most of this code was modified from the Drupal 6 Wraplogin module... 
+ * which was based on the pubcookie module... which performs the same 
+ * functions for a similar system.
+ */
+
+// Do you want the post-wraplogin-server-visit $_SERVER vars dumped to the 
+// screen (useful for getting the wraplogin.module set up for the first time)?
+define ( 'WRAPLOGIN_DEBUG_MODE', 0 );
+
+// Enable for lots of watchdog messages showing what's going on.
+define ( 'WRAPLOGIN_VERBOSE_LOGGING', 0 );
+
+/**
+ * Implementation of hook_menu().
+ */
+function wraplogin_menu() {
+	$items [wraplogin_login_link ()] = array (
+		'title' => 'WRAP login', 
+		'page callback' => 'wraplogin_page', 
+		'access callback' => TRUE, 
+		'type' => MENU_CALLBACK 
+	);
+	$items ['admin/config/people/wraplogin'] = array (
+		'title' => 'WRAP login', 
+		'description' => 'Configure settings for WRAP authentication.', 
+		'page callback' => 'drupal_get_form', 
+		'page arguments' => array ('wraplogin_settings' ), 
+		'access arguments' => array ('administer site configuration' ) 
+	);
+	
+	return $items;
+}
+
+/**
+ * Handle a client who has just been redirected to a WRAP webauth server,
+ * authenticated, and returned.
+ */
+function wraplogin_page() {
+	global $user;
+	// Raw user from Apache's WRAP_USERID || REDIRECT_WRAP_USERID
+	global $wraplogin_user;
+	// Domain of wraplogin server.
+	global $wraplogin_domain;
+	// Drupal userid to use
+	global $wraplogin_drupaluser;
+	
+	if (WRAPLOGIN_DEBUG_MODE) {
+		print '<pre>';
+		print_r ( $_SERVER );
+		print '</pre>';
+	}
+	
+	if ($user->uid) {
+		print theme ( 'page', t ( 'You are already logged in.' ) );
+		return;
+	}
+	
+	if (! isset ( $_SERVER ['WRAP_USERID'] ) && ! isset ( $_SERVER ['REDIRECT_WRAP_USERID'] )) {
+		watchdog ( 'wraplogin', 'WRAP request received but neither WRAP_USERID nor REDIRECT_WRAP_USERID were set.', array (), WATCHDOG_WARNING );
+		drupal_set_message ( t ( 'WRAP login failed.' ), 'error' );
+		drupal_goto ();
+	}
+	
+	if (isset ( $_SERVER ['WRAP_USERID'] )) {
+		$wraplogin_user = check_plain ( $_SERVER ['WRAP_USERID'] );
+	} else {
+		$wraplogin_user = check_plain ( $_SERVER ['REDIRECT_WRAP_USERID'] );
+	}
+	watchdog ( 'wraplogin', 'Received login request from %user', array ('%user' => $wraplogin_user ) );
+	if (WRAPLOGIN_VERBOSE_LOGGING) {
+		watchdog ( 'wraplogin', 'Session ID is %sessid', array ('%sessid' => check_plain ( session_id () ) ) );
+	}
+	
+	// set default, then check env
+	$wraplogin_domain = 'ncsu.edu';
+	if (isset ( $_SERVER ['WRAP_AFFIL'] )) {
+		$wraplogin_domain = check_plain ( $_SERVER ['WRAP_AFFIL'] );
+	}
+	if (isset ( $_SERVER ['REDIRECT_WRAP_AFFIL'] )) {
+		$wraplogin_domain = check_plain ( $_SERVER ['REDIRECT_WRAP_AFFIL'] );
+	}
+	
+	// Drupal userid is USERID.DOMAIN
+	$wraplogin_drupaluser = check_plain ( $wraplogin_user . '.' . $wraplogin_domain );
+	
+	// Login the user, creating the account if needed
+	$account = user_external_load ( $wraplogin_drupaluser );
+	if (! $account) {
+		user_external_login_register ( $wraplogin_drupaluser, 'wraplogin' );
+	} else {
+		//user_external_login($account);
+		$form_state ['uid'] = $account->uid;
+		user_login_submit ( array (), $form_state );
+	}
+	if ($user->uid && $user->uid != 1) {
+		// Login successful.
+		if (WRAPLOGIN_VERBOSE_LOGGING) {
+			watchdog ( 'wraplogin', "uid of authenticated user is '%uid'", array ('%uid' => $user->uid ) );
+		}
+		
+		// force the wrap role if we have one defined, regardless of db
+		$foundrid = wraplogin_find_wrap_rid ();
+		if ($foundrid) {
+			$user->roles [$foundrid] = 1;
+		}
+		
+		// let drupal handle the destination
+		drupal_goto ();
+	}
+	
+	drupal_set_message ( t ( 'WRAP login failed.' ), 'error' );
+	drupal_goto ();
+
+}
+
+/*
+ * 
+ * Custom validation function to manage whether or not the username submitted is WRAP or not (and whether it should be)
+ * @param mixed $element Posted form structure
+ * 
+ */
+function wraplogin_username_validate($element) {
+	
+	/* 
+	  // for debugging
+	  echo '<pre>';
+	  form_set_error('name', print_r($element['wraplogin']['iswrap']));
+	  die();
+	*/
+	
+	// Get username from form elements
+	$username = $element ['account'] ['name'] ['#value'];
+	
+	/** If username not set, do not validate */
+	if (! $username) {
+		
+		form_set_error ( 'name', 'Username not set.' );
+	
+	} else {
+		
+		// get wrap checkbox value
+		$wrapIsChecked = $element ['wraplogin'] ['iswrap'] ['#value'];
+		
+		// if the WRAP checkbox is checked
+		if ($wrapIsChecked) {
+			
+			// if the wrap checkbox is checked, then make sure that the username meets the WRAP format
+			if (! wraplogin_custom_validate_username_for_wrap ( $username )) {
+				form_set_error ( 'name', 'The requested username does not appear to be a valid WRAP username.' );
+			}
+		
+		} else {
+			// WRAP is not checked, so we need to validate that the requested username does not match the WRAP format.
+			if (wraplogin_custom_validate_username_for_wrap ( $username )) {
+				form_set_error ( 'name', 'The requested username appears to be a valid WRAP username. Please check the WRAP checkbox or choose another username' );
+			}
+		}
+	}
+	
+	return;
+
+}
+
+/*
+ * Implementation of hook_form_FORM_ID_alter
+ * http://api.drupal.org/api/drupal/modules--system--system.api.php/function/hook_form_FORM_ID_alter/7
+ * 
+ */
+function wraplogin_form_user_register_form_alter(&$form) {
+	// add WRAP account creates
+	$form ['wraplogin'] = array (
+		'#type' => 'fieldset', 
+		'#title' => 'WRAP Login', 
+		'#weight' => - 15 
+	);
+	$form ['wraplogin'] ['iswrap'] = array (
+		'#type' => 'checkbox', 
+		'#title' => 'WRAP User', 
+		'#default_value' => 0, 
+		'#description' => '
+			If this is checked, this userid will be registered as a Unity/WRAP account.<br /><br />
+			You must enter the Username as "<strong>unityid.ncsu.edu</strong>".<br />
+			You should enter the E-mail address as "<strong>unityid@ncsu.edu</strong>".<br />
+			You must enter a Password, but it will be discarded.', 
+		'#weight' => - 10 
+	);
+	
+	$form ['#validate'] [] = 'wraplogin_username_validate';
+	
+	return $form;
+}
+
+/*
+ * Implementation of hook_form_FORM_ID_alter
+ * http://api.drupal.org/api/drupal/modules--system--system.api.php/function/hook_form_FORM_ID_alter/7
+ * 
+ */
+
+function wraplogin_form_user_profile_form_alter(&$form, &$form_state) {
+	
+	/* 
+	// for debugging
+    echo '<pre>';
+    echo $form['account']['name']['#default_value'];
+    print_r($form['account']);
+    die();
+    */
+	
+	// validation is going to look for this on a user edit
+	$iswrap = 0;
+	if (wraplogin_custom_validate_username_for_wrap ( $form ['account'] ['name'] ['#default_value'] )) {
+		$iswrap = 1;
+	}
+	
+	// add WRAP account creates
+	$form ['wraplogin'] = array ('#type' => 'fieldset', '#title' => 'WRAP Login', '#weight' => - 15 );
+	$form ['wraplogin'] ['iswrap'] = array (
+		'#type' => 'checkbox', 
+		'#title' => 'WRAP User', 
+		'#default_value' => $iswrap, 
+		'#description' => '
+			If this is checked, this userid will be registered as a Unity/WRAP account.<br /><br />
+			You must enter the Username as "<strong>unityid.ncsu.edu</strong>".<br />
+			You should enter the E-mail address as "<strong>unityid@ncsu.edu</strong>".<br />
+			You must enter a Password, but it will be discarded.', 
+		'#weight' => - 10 );
+	
+	$form ['#validate'] [] = 'wraplogin_username_validate';
+	
+	return $form;
+}
+
+/*
+ * Implementation of hook_user_update
+ * http://api.drupal.org/api/drupal/modules--user--user.api.php/function/hook_user_update/7
+ * 
+ */
+function wraplogin_user_update(&$edit, $account, $category) {
+	
+	if ($edit ['iswrap']) {
+		
+		if (!wraplogin_custom_validate_username_for_wrap ( $account->name )) {
+			
+			form_set_error ( 'name', 'The requested username does not appear to be a valid WRAP username.' );
+			
+		}
+		
+	} else {
+		
+		if (wraplogin_custom_validate_username_for_wrap ( $account->name )) {
+
+			form_set_error ( 'iswrap', 'The requested username appears to be a WRAP username, please check the WRAP User box to create this account.' );
+		
+		}
+	}
+	
+	return;
+
+}
+
+/*
+ * 
+ * Implementation of hook_user_insert
+ * http://api.drupal.org/api/drupal/modules--user--user.api.php/function/hook_user_insert/7
+ * 
+ */
+
+function wraplogin_user_insert(&$insertedUser, $account, $category) {
+	
+	// debugging
+	//form_set_error('name', print_r($insertedUser) . '<hr />' . print_r($account) . '<hr />' . print_r($category));
+	
+	//check to see if the username being created is a wrap username
+  	if(!isset($insertedUser ['iswrap']) && wraplogin_custom_validate_username_for_wrap($insertedUser['name'])) {
+		$insertedUser ['iswrap'] = 1;	
+	}
+  	
+	// check to see if the user being added is a wrap user
+	if ($insertedUser ['iswrap']) {
+		
+		// Set the mail column of the user table (which is typically blank 
+		// for users with external auth) only if wraplogin_user@saved_domain 
+		// is also an email address.
+			$saved_domain = variable_get ( 'wraplogin_email_domain', 'ncsu.edu' );
+			db_update ( 'users' )->fields ( array (
+				'mail' => strstr ( $insertedUser ['name'], '.', true ) . '@' . $saved_domain, 
+				'timezone' => 'America/New_York' ) 
+			)
+			->condition ( 'uid', $insertedUser ['uid'], '=' )
+			->execute ();
+		
+		// find the WRAP role ID
+		$wrapRoleId = wraplogin_find_wrap_rid();
+
+		// add wrap role to user objects so it will be added correctly during the insert.
+		// this is used for both manual user creations & when a WRAP user logs in for the first time
+		$insertedUser['roles'][$wrapRoleId] = 'Unity users';
+		$account->roles[$wrapRoleId] = 'Unity users';
+		
+		if (WRAPLOGIN_VERBOSE_LOGGING) {
+			watchdog ( 'wraplogin', 'User callback received for user %uid', array ('%uid' => $insertedUser ['uid'] ) );
+		}
+		
+		return;
+	
+	} else {
+		
+		// user is not a WRAP user, so ignore and return
+		if (WRAPLOGIN_VERBOSE_LOGGING) {
+			watchdog ( 'wraplogin', 'Ignoring: non-WRAP user login' );
+		}
+		
+		return;
+	}
+
+}
+
+/*
+ * 
+ * Implementation of hook_user_logout
+ * http://api.drupal.org/api/drupal/modules--user--user.api.php/function/hook_user_logout/7
+ *  
+ */
+function wraplogin_user_logout($account) {
+	
+	// add a WRAP logout cookie
+	setcookie ( 'WRAP16', '.LOGOUT+NOUSER+NOAFFIL+NOADDR', 0, '/', '.ncsu.edu' );
+
+}
+
+/*
+ * 
+ *	Implementation of hook_block_info() as per 
+ *	http://api.drupal.org/api/drupal/modules--block--block.api.php/function/hook_block_info/7 
+ * 
+ */
+
+function wraplogin_block_info() {
+	// This example comes from node.module.
+	$blocks ['info'] = array ('info' => t ( 'WRAP Login' ), 'cache' => DRUPAL_NO_CACHE );
+	
+	// DRUPAL_CACHE_PER_ROLE will be assumed.
+	
+
+	return $blocks;
+
+}
+
+/*
+ * Implementation of hook_block().
+ *
+ * Display the wraplogin "Log in" link.
+ */
+function wraplogin_block_view($delta = 0, $edit = array()) {
+	
+	global $user;
+	
+	$block = array ();
+	
+	if (! $user->uid) {
+		if (variable_get ( 'wraplogin_auto_login', 0 )) {
+			$destination = drupal_get_destination ();
+			$loginlink = wraplogin_login_link ();
+			if(isset($_COOKIE ['WRAP16'])) {
+				if ($_COOKIE ['WRAP16'] && substr ( $_COOKIE ['WRAP16'], 0, 4 ) != '.LOG') {
+					// goto is stupid, we need to clear some variables to make it work
+					unset ( $_REQUEST ['destination'] );
+					unset ( $_REQUEST ['edit'] ['destination'] );
+					drupal_goto ( $loginlink, $destination );
+					return;
+				}
+			}
+		}
+		$block ['subject'] = 'NC State University login';
+		$block ['content'] = theme('wraplogin_login');
+	}
+	
+	return $block;
+
+}
+
+/**
+ * Implementation of hook_theme().
+ */
+function wraplogin_theme() {
+	return array ('wraplogin_login' => array ('arguments' => array () ) );
+}
+
+/** 
+ * Theme function for wraplogin login link.
+ */
+function theme_wraplogin_login() {
+	$linktext = variable_get ( 'wraplogin_login_text', 'Unity Login (WRAP)' );
+	return l ( $linktext, wraplogin_login_link (), array ('query' => drupal_get_destination () ) );
+}
+
+/*
+ *  The link must be to a nonexistent file in a directory containing an 
+ *  .htaccess file with proper WRAP directives. The file must "fall through" 
+ *  Apache after authentication to Drupal's menu system and be 
+ *  directed to the wraplogin_page() function. By default we look for 
+ *  a nonexistent file named wrap.
+ */
+function wraplogin_login_link() {
+	return variable_get ( 'wraplogin_login_dir', 'wraplogin' ) . '/wrap';
+}
+
+/*
+ * The wraplogin settings page.
+ */
+function wraplogin_settings() {
+	global $base_url; // http://www.example.edu/drupal
+	
+
+	$form ['wraplogin_login_text'] = array (
+		'#type' => 'textfield', 
+		'#title' => t ( 'Login link text' ), 
+		'#default_value' => variable_get ( 'wraplogin_login_text', 'Unity Login (WRAP)' ), 
+		'#description' => t ( 'This module provides a simple link to login to WRAP, rather than a username/password form. Use this option to set the text of the link that will be presented in the WRAP Login block.' ), 
+		'#size' => '40', 
+		'#maxlength' => '255' 
+	);
+	$form ['wraplogin_auto_login'] = array (
+		'#type' => 'checkbox', 
+		'#title' => t ( 'Use Automatic Login' ), 
+		'#default_value' => variable_get ( 'wraplogin_auto_login', 0 ), 
+		'#description' => t ( "Check this box to make drupal automatically perform a login when the user has previously logged in to WRAP and has sent a WRAP cookie." ) 
+	);
+	$form ['wraplogin_id_is_email'] = array (
+		'#type' => 'checkbox', 
+		'#title' => t ( 'ID/E-mail equivalency' ), 
+		'#default_value' => variable_get ( 'wraplogin_id_is_email', 1 ), 
+		'#description' => t ( "Check this box if the login ID (joe@ncsu.edu) is the same as the user's email address. If so, the mail column of the user table will be populated when a user registers." ) 
+	);
+	$form ['wraplogin_email_domain'] = array (
+		'#type' => 'textfield', 
+		'#title' => t ( 'E-mail domain' ), 
+		'#default_value' => variable_get ( 'wraplogin_email_domain', 'ncsu.edu' ), 
+		'#description' => t ( "When ID/E-mail equivalency is checked, this domain will be added to the user's login ID to form the user's e-mail address." ), 
+		'#size' => '40', 
+		'#maxlength' => '80' 
+	);
+	$form ['wraplogin_default_role'] = array (
+		'#type' => 'textfield', 
+		'#title' => t ( 'Default user role' ), 
+		'#default_value' => variable_get ( 'wraplogin_default_role', 'Unity users' ), 
+		'#description' => t ( "All users who login through WRAP will be added to this role automatically. This can be used to differentiate WRAP users from other types of authenticated users. Leave blank to set no roles." ), 
+		'#size' => '40', 
+		'#maxlength' => '255' 
+	);
+	
+	return system_settings_form ( $form );
+}
+
+function wraplogin_find_wrap_rid() {
+	$foundrid = FALSE;
+	$defrole = variable_get ( 'wraplogin_default_role', 'Unity users' );
+	if ($defrole != '') {
+		
+		// list of current roles [rid] => 'name of role'
+		$allroles = user_roles ();
+		
+		// look for a match
+		foreach ( $allroles as $rid => $rname ) {
+			if ($defrole == $rname) {
+				$foundrid = $rid;
+			}
+		}
+		
+		// no match, lets add the role then use it, if we can
+		if (! $foundrid) {
+			$roleInsert = db_insert ( 'role' )
+				->fields ( array ('name' => $defrole ) )
+				->execute ();
+			
+			// query to get the rid of the WRAP Role
+			// ref http://api.drupal.org/api/drupal/includes--database--database.inc/function/db_query/7
+			
+			// returns object
+			$result = db_query('SELECT rid FROM {role} n WHERE name = :name', array(':name' => $defrole));
+			
+			// grab rid from returned object
+			foreach($result as $role) {
+				$foundrid = $role->rid;	
+			}
+			
+		}
+	}
+	
+	return $foundrid;
+}
+
+/**
+ * Implementation of hook_cron()
+ * http://api.drupal.org/api/drupal/modules--system--system.api.php/function/hook_cron/7
+ */
+function wraplogin_cron() {
+	
+	/*
+	 * Removed next update/last update parameters as was set in drupal 6 version
+	 * Reason: If we check against our own setting for when cron last ran, it prevents
+	 * the admin from using a manual cron run to update all users to the correct roles.
+	 */
+
+	//ensure the wraplogin directory exist with the htaccess file inside it
+	wraplogin_ensure_wraplogin_directory_htaccess_exists();
+	
+		// if the WRAP Role ID is not found, then don't do anything
+		$foundrid = wraplogin_find_wrap_rid ();
+		if (! $foundrid) {
+			return;
+		}
+		
+		// force all users that match the naming convention (ending in .ncsu.edu)
+		
+		$num_deleted = db_delete ( 'users_roles' )
+			->condition ( 'rid', $foundrid )
+			->execute ();
+		
+		$result = db_query ( "SELECT uid, name FROM {users} WHERE status != 0 AND name LIKE '%%.ncsu.edu'" );
+		foreach ( $result as $account ) {
+			// print "adding  $account->uid, $foundrid<br />\n";
+			$insert = db_insert ( 'users_roles' )
+				->fields ( array (
+					'uid' => $account->uid, 
+					'rid' => $foundrid ) 
+				)
+				->execute ();
+			
+			// update mail field only if empty
+			if (empty ( $account->mail )) {
+				
+				$update = db_update ( 'users' )
+					->fields ( array (
+						'mail' => strstr ( $account->name, '.', true ) . '@ncsu.edu' ) 
+					)
+					->condition ( 'uid', $account->uid, '=' )
+					->execute ();
+			}
+			
+			// update timezone field only if empty
+			if (empty ( $account->timezone )) {
+				$update = db_update ( 'users' )
+					->fields ( array (
+						'timezone' => 'America/New_York' ) 
+					)
+					->condition ( 'uid', $account->uid, '=' )
+					->execute ();
+			}
+		
+		}
+		
+		watchdog ( 'wraplogin', 'cron reset default role settings on wrap accounts' );
+		watchdog ( 'wraplogin', 'cron updated all empty timezones and mail fields for wrap accounts' );
+		variable_set ( 'wraplogin_lastcron', time () );
+	
+}
+
+/**
+ * Implementation of hook_form_alter()
+ * http://api.drupal.org/api/drupal/modules--system--system.api.php/function/hook_form_alter/7
+ */
+function wraplogin_form_alter(&$form, $form_state, $form_id) {
+	// Add Unity login warning to the standard login form
+	if ($form_id == 'user_login') {
+		$form ['wraplogin'] = array (
+			'#type' => 'fieldset', 
+			'#title' => 'Unity Logins', 
+			'#weight' => - 5, 
+			'#description' => '<strong>Do not try to login with your Unity password on this form!</strong><br />If you are using your Unity account, please login with this link instead:<br />' . theme ( 'wraplogin_login' ) 
+		);
+	}
+}
+
+/*
+ * Implementation of hook_enable()
+ * http://api.drupal.org/api/drupal/modules--system--system.api.php/function/hook_enable/7
+ * 
+ */
+
+function wraplogin_enable() {
+  
+	//ensure the wraplogin directory exist with the htaccess file inside it
+	wraplogin_ensure_wraplogin_directory_htaccess_exists();
+	
+}
+
+/*
+ * Implementation of hook_disable()
+ * http://api.drupal.org/api/drupal/modules--system--system.api.php/function/hook_disable/7
+ * 
+ */
+function wraplogin_disable() {
+  
+	/*
+	 * remove the wraplogin directory as it is not required.
+	 * any htaccess rules for the drupal site (without the wraplogin module) 
+	 * would require the rules to be in the root htaccess file anyway..so...
+	 * deleting the wraplogin directory should not affect anything
+	 * 
+	 */
+	
+	wraplogin_custom_delete_wraplogin_htaccess_directory();
+	
+}
+
+/*
+ * Custom function to ensure the wraplogin directory exist with the htaccess file inside it
+ *  
+ */
+
+function wraplogin_ensure_wraplogin_directory_htaccess_exists() {
+	
+	// ensure the wraplogin directory exists first
+	wraplogin_custom_ensure_wrap_directory_exists();
+	
+	// ensure the htaccess file exists
+	wraplogin_custom_ensure_wrap_directory_htaccess_exists();
+	
+}
+
+function wraplogin_get_root_directory_of_drupal() {
+	
+	// get root directory of installation
+	// -10 is to denote the length of the /index.php which is at the end of the SCRIPT_FILENAME variable
+	return substr ( $_SERVER['SCRIPT_FILENAME'], 0, -10 );
+	
+}
+
+/*
+ * Custom function to ensure the wraplogin directory exists
+ *  
+ */
+
+function wraplogin_custom_ensure_wrap_directory_exists() {
+	
+	// check to see if the wraplogin directory exists. If not, create it.
+	if(!is_dir(wraplogin_custom_get_wraplogin_htaccess_directory())) {
+		mkdir(wraplogin_custom_get_wraplogin_htaccess_directory(), 0755, false);	
+	}
+	return true;
+}
+
+/*
+ * Custom function to ensure the .htaccess file exists inside the wraplogin directory
+ *  
+ */
+
+function wraplogin_custom_ensure_wrap_directory_htaccess_exists() {
+	
+	// if the .htaccess file does not exist where it is supposed to, then create it
+	// the understanding is that if the file exists, the contents should be correct/functional
+	// if the site admin changes the contents of the htaccess, it is assumed it is on purpose
+	// (and so this file will not overwrite it).
+	if(!file_exists(wraplogin_custom_get_wraplogin_htaccess_file())) {
+		$handle = fopen(wraplogin_custom_get_wraplogin_htaccess_file(), 'w');
+		$data = 'AuthType WRAP' . PHP_EOL;
+		$data .= 'require affiliation ncsu.edu' . PHP_EOL;
+		$data .= 'require known-user' . PHP_EOL;
+		fwrite($handle, $data);
+	}
+	return true;
+}
+
+/*
+ * Custom function to remove the wraplogin directory that contains the htaccess file
+ * Located at <site root>/wraplogin
+ * 
+ */
+
+function wraplogin_custom_delete_wraplogin_htaccess_directory() {
+	
+	// check to see if the wraplogin/.htaccess file exists. If so, delete it.
+	if(file_exists(wraplogin_custom_get_wraplogin_htaccess_file())) {
+		unlink(wraplogin_custom_get_wraplogin_htaccess_file());
+	}
+	
+	// check to see if the wraplogin directory exists. If so, delete it.
+	if(is_dir(wraplogin_custom_get_wraplogin_htaccess_directory())) {
+		rmdir(wraplogin_custom_get_wraplogin_htaccess_directory());	
+	}
+	return true;
+}
+
+/*
+ * Custom function to specify the wraplogin directory path
+ * 
+ */
+
+function wraplogin_custom_get_wraplogin_htaccess_directory() {
+	return wraplogin_get_root_directory_of_drupal() . '/wraplogin';
+}
+
+/*
+ * Custom function to specify the wraplogin/.htaccess file path
+ * 
+ */
+
+function wraplogin_custom_get_wraplogin_htaccess_file() {
+	return wraplogin_custom_get_wraplogin_htaccess_directory() . '/.htaccess';
+}
+
+
+/*
+ *
+ * Custom function
+ * Validate a username to see if it meets the WRAP requirements
+ * Returns true if it meets the requirements, false if it does not
+ * 
+ */
+
+function wraplogin_custom_validate_username_for_wrap($username) {
+	
+	if (preg_match ( '/^[\f\t]*([a-z0-9_-]{3,8})\.ncsu\.edu/', strtolower ( $username ), $parts )) {
+		return true;
+	} else {
+		return false;
+	}
+
+}
+
+?>

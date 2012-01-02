@@ -1,0 +1,12 @@
+;$Id$
+name = "WRAP Login"
+description = "Allows NCSU users to log into your site using WRAP."
+package = External authentication
+
+version="7.x-0.1"
+core = 7.x
+project = "wraplogin"
+php = 5.1
+
+; for updates to the theme, specify features server location
+project status url = http://drupal.ncsu.edu/features/fserver

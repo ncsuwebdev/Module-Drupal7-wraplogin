@@ -1,0 +1,17 @@
+NC State University WRAP Module to work with Drupal 7.
+
+
+******************************************
+             INSTALLATION
+******************************************
+
+1. Visit http://drupal.ncsu.edu/features
+2. Download the Wrap Login module for Drupal 7
+3. Extract the contents into your Drupal installation at the following path:
+        yoursite-root-folder/sites/all/modules/contrib/wraplogin
+4. If extracted correctly, the wraplogin.info file should be located at:
+        yoursite-root-folder/sites/all/modules/contrib/wraplogin/wraplogin.info
+5. Enable the module via the Drupal control panel and configure as described in README.TXT.
+
+Additional information available in README.TXT
+
