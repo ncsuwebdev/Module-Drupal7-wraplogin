@@ -397,7 +397,7 @@ function wraplogin_theme() {
  */
 function theme_wraplogin_login() {
 	$linktext = variable_get ( 'wraplogin_login_text', 'Unity Login (WRAP)' );
-	return l ( $linktext, wraplogin_login_link (), array ('query' => drupal_get_destination () ) );
+	return '<div id="wraplogin_module_linktext"><p>' . l ( $linktext, wraplogin_login_link (), array ('query' => drupal_get_destination () ) ) . '</p></div>';
 }
 
 /*
