@@ -1,6 +1,6 @@
 //$Id$
 
-WRAPlogin module v7.x-0.1
+WRAPlogin module 7.x-1.1
 =========================
 By njyoung at ncsu.edu
 Modified from wraplogin (d6) by brabec at ncsu.edu

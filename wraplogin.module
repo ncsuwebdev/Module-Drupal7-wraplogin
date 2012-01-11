@@ -42,6 +42,7 @@ function wraplogin_menu() {
  * authenticated, and returned.
  */
 function wraplogin_page() {
+	
 	global $user;
 	// Raw user from Apache's WRAP_USERID || REDIRECT_WRAP_USERID
 	global $wraplogin_user;
@@ -86,13 +87,18 @@ function wraplogin_page() {
 		$wraplogin_domain = check_plain ( $_SERVER ['REDIRECT_WRAP_AFFIL'] );
 	}
 	
+	
+	    
 	// Drupal userid is USERID.DOMAIN
 	$wraplogin_drupaluser = check_plain ( $wraplogin_user . '.' . $wraplogin_domain );
 	
 	// Login the user, creating the account if needed
 	$account = user_external_load ( $wraplogin_drupaluser );
+	
 	if (! $account) {
+		
 		user_external_login_register ( $wraplogin_drupaluser, 'wraplogin' );
+		
 	} else {
 		//user_external_login($account);
 		$form_state ['uid'] = $account->uid;
@@ -284,6 +290,16 @@ function wraplogin_user_insert(&$insertedUser, $account, $category) {
 	// check to see if the user being added is a wrap user
 	if ($insertedUser ['iswrap']) {
 		
+		// insert entry into authmap for this user so it can successfully login for the first time
+		$insert = db_insert ( 'authmap' )
+				->fields ( array (
+					'uid' => $insertedUser ['uid'], 
+					'authname' =>  $insertedUser ['name'],
+					'module' =>  'wraplogin'
+					) 
+				)
+				->execute ();
+		
 		// Set the mail column of the user table (which is typically blank 
 		// for users with external auth) only if wraplogin_user@saved_domain 
 		// is also an email address.
@@ -397,7 +413,7 @@ function wraplogin_theme() {
  */
 function theme_wraplogin_login() {
 	$linktext = variable_get ( 'wraplogin_login_text', 'Unity Login (WRAP)' );
-	return '<div id="wraplogin_module_linktext"><p>' . l ( $linktext, wraplogin_login_link (), array ('query' => drupal_get_destination () ) ) . '</p></div>';
+	return l ( $linktext, wraplogin_login_link (), array ('query' => drupal_get_destination () ) );
 }
 
 /*
