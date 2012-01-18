@@ -249,7 +249,7 @@ function wraplogin_form_user_profile_form_alter(&$form, &$form_state) {
  */
 function wraplogin_user_update(&$edit, $account, $category) {
 	
-	if ($edit ['iswrap']) {
+	if (isset($edit ['iswrap']) && $edit['iswrap']) {
 		
 		if (!wraplogin_custom_validate_username_for_wrap ( $account->name )) {
 			
@@ -261,7 +261,7 @@ function wraplogin_user_update(&$edit, $account, $category) {
 		
 		if (wraplogin_custom_validate_username_for_wrap ( $account->name )) {
 
-			form_set_error ( 'iswrap', 'The requested username appears to be a WRAP username, please check the WRAP User box to create this account.' );
+			drupal_set_message ( $account->name . ' is a WRAP username. The WRAP user checkbox is set for this account.', 'status' );
 		
 		}
 	}
