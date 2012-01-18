@@ -3,7 +3,7 @@ name = "WRAP Login"
 description = "Allows NCSU users to log into your site using WRAP."
 package = "NC State University Custom Modules"
 
-version="7.x-1.1"
+version="7.x-1.2"
 core = 7.x
 project = "wraplogin"
 php = 5.1
